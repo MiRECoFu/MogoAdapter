@@ -106,6 +106,7 @@ if __name__ == '__main__':
     vq_opt_path = pjoin(opt.checkpoints_dir, opt.dataset_name, model_opt.vq_name, 'opt.txt')
     vq_opt = get_opt(vq_opt_path, device=opt.device)
     vq_model, vq_opt = load_vq_model()
+    print(vq_opt)
     
     mogo_adapter = MogoAdapter(
         max_motion_length=opt.max_motion_length,
@@ -116,7 +117,7 @@ if __name__ == '__main__':
         mogo_dim=1024,
         mogo_q_layers=6,
         scale=1,
-        vq_model=vq_model,
+        num_tokens=vq_opt.nb_code,
         device=opt.device
     )
     mogo_adapter.to(opt.device)
@@ -175,7 +176,7 @@ if __name__ == '__main__':
         input_motion_logits = all_attends_out.to(opt.device)
         motion_code_feature2 = mogo_clip.encode_motion_code(motion_code2).to(opt.device)
         text_feature2 = mogo_clip.encode_text(captions2).to(opt.device)
-        mogo_adapter(all_attends_out, text_feature2, motion_code_feature2, m_lens2)
+        mogo_adapter(all_attends_out, text_feature2, motion_code_feature2)
         print(f"positive_mean2: {positive_mean2} negative_mean1:{negative_mean2}")
         if i == 5:
             break

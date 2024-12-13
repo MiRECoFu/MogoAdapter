@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 import clip
-from tools import *
+# from tools import *
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
@@ -80,7 +80,7 @@ class MogoAdapter(nn.Module):
                  mogo_dim: int,
                  mogo_q_layers: int,
                  scale: int,
-                 vq_model,
+                 num_tokens: int,
                  device
                 ):
         super().__init__()
@@ -91,16 +91,14 @@ class MogoAdapter(nn.Module):
         self.mogo_dim = mogo_dim
         self.mogo_q_layers = mogo_q_layers
         self.width = width
+        self.num_tokens = num_tokens
+        
         
         self.layers = layers
         self.heads = heads
         
         self.scale = scale
-        self.vq_model = vq_model
-        self.vq_model.eval()
-        for param in self.vq_model.parameters():
-            param.requires_grad = False
-        
+
         self.trms = nn.ModuleList([])
         
         for i in range(mogo_q_layers):
@@ -120,12 +118,14 @@ class MogoAdapter(nn.Module):
         self.positional_embedding = nn.Parameter(torch.empty(self.max_motion_length, width))
         self.ln_final = LayerNorm(width)
         self.cond_emb = nn.Linear(self.mogo_clip_embed_dim, self.mogo_dim)
+        self.head = nn.Linear(self.mogo_dim, self.num_tokens, bias=False) 
         self.initialize_parameters()
         
     def initialize_parameters(self):
         nn.init.normal_(self.positional_embedding, std=0.01)
         
         nn.init.normal_(self.cond_emb.weight, std=(2 * self.mogo_dim) ** -0.5)
+        nn.init.normal_(self.head.weight, std=(2 * self.mogo_dim) ** -0.5)
         
         proj_std = (self.width ** -0.5) * ((2 * self.layers) ** -0.5)
         attn_std = self.width ** -0.5
@@ -137,10 +137,6 @@ class MogoAdapter(nn.Module):
                 nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
                 nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
-
-
-            
-        
     
     def build_attention_mask(self):
         # pytorch uses additive attention mask; fill with -inf
@@ -149,19 +145,27 @@ class MogoAdapter(nn.Module):
         mask.triu_(1)  # zero out the lower diagonal
         return mask
     
-    def forward(self, input_motion_logits, refer_text_features, refer_motion_clip_features, refer_motion_lens, is_generate=False):
+    def forward(self, input_motion_logits, refer_text_features, refer_motion_clip_features, scale=1, is_generate=False):
         bs, m_len, motion_dim, q = input_motion_logits.shape
         refer_motion_features = self.cond_emb(refer_motion_clip_features)
         refer_motion_features = refer_motion_features.unsqueeze(1).unsqueeze(-1)
         refer_motion_features = refer_motion_features.repeat(1, m_len, 1, q).type(input_motion_logits.dtype).to(self.device)
         # print(f"refer_motion_features: {refer_motion_features} {refer_motion_features.shape} input_motion_logits: {input_motion_logits.shape}")
         res_atts = []
+        all_out = []
         for ind, transformer in enumerate(self.trms):
             input_motion_layer_logits = input_motion_logits[:, :, :, ind].permute(1, 0, 2)
             refer_motion_layer_features = refer_motion_features[:, :, :, ind].permute(1, 0, 2)
             att = transformer(input_motion_layer_logits, refer_motion_layer_features)
-            print(f"cross att res: {att}, {att.shape}")
+            res_feat = scale * att + input_motion_layer_logits
             att = att.permute(1, 0, 2)
-            res_atts.append(att)
+            out = self.head(res_feat)
+            res_atts.append(res_feat)
+            all_out.append(out)
         res_features = torch.stack(res_atts, dim=-1)
-        print(f"res_features res: {res_features}, {res_features.shape}")
+        res_all_out = torch.stack(all_out, dim=-1)
+        # print(f"res_features res: {res_features}, {res_features.shape}, res_all_out: {res_all_out}, {res_all_out.shape}")
+        return res_features, res_all_out
+    
+    def generate(self):
+        pass
