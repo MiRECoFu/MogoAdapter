@@ -405,25 +405,42 @@ def evaluation_res_plus_l1(val_loader, vq_model, res_model, repeat_id, eval_wrap
     return fid, diversity, R_precision, matching_score_pred, l1_dist
 
 @torch.no_grad()
-def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep, best_fid, best_div,
+def evaluation_mask_transformer(out_dir, val_loader1, val_loader2, trans, vq_model, mogo_adapter, mogo_clip, writer, ep, best_fid, best_div,
                            best_top1, best_top2, best_top3, best_matching, eval_wrapper, plot_func,
                            save_ckpt=False, save_anim=True):
 
+    # def save(file_name, ep):
+    #     t2m_trans_state_dict = trans.state_dict()
+    #     clip_weights = [e for e in t2m_trans_state_dict.keys() if e.startswith('clip_model.')]
+    #     for e in clip_weights:
+    #         del t2m_trans_state_dict[e]
+    #     state = {
+    #         'transformotion': t2m_trans_state_dict,
+    #         # 'opt_t2m_transformer': self.opt_t2m_transformer.state_dict(),
+    #         # 'scheduler':self.scheduler.state_dict(),
+    #         'ep': ep,
+    #     }
+    #     torch.save(state, file_name)
     def save(file_name, ep):
-        t2m_trans_state_dict = trans.state_dict()
-        clip_weights = [e for e in t2m_trans_state_dict.keys() if e.startswith('clip_model.')]
-        for e in clip_weights:
-            del t2m_trans_state_dict[e]
+        mogo_adapter_state_dict = self.mogo_adapter.state_dict()
+        vq_model_weights = [e for e in mogo_adapter_state_dict.keys() if e.startswith('vq_model.')]
+        for e in vq_model_weights:
+            del mogo_adapter_state_dict[e]
+        transformotion_weights = [e for e in mogo_adapter_state_dict.keys() if e.startswith('transformotion.')]
+        for e in transformotion_weights:
+            del mogo_adapter_state_dict[e]
+        mogo_clip_weights = [e for e in mogo_adapter_state_dict.keys() if e.startswith('mogo_clip.')]
+        for e in mogo_clip_weights:
+            del mogo_adapter_state_dict[e]
         state = {
-            'transformotion': t2m_trans_state_dict,
-            # 'opt_t2m_transformer': self.opt_t2m_transformer.state_dict(),
-            # 'scheduler':self.scheduler.state_dict(),
+            'mogo_adapter': mogo_adapter_state_dict,
             'ep': ep,
         }
         torch.save(state, file_name)
-
     trans.eval()
     vq_model.eval()
+    mogo_clip.eval()
+    mogo_adapter.eval()
 
     motion_annotation_list = []
     motion_pred_list = []
@@ -444,35 +461,34 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
     nb_sample = 0
     # mems = tuple()
     # for i in range(1):
-    for batch in val_loader:
+    for (batch, batch2) in zip(val_loader1, val_loader2):
         
         word_embeddings, pos_one_hots, clip_text, sent_len, pose, m_length, token = batch
-        print(f"pose=======+>pose.shape: {pose.shape}")
-        pose = pose.cuda()
-        motion_ids, _motion_emb = vq_model.encode(pose)
-        # print(f"_motion_emb===>{_motion_emb[0].shape}\n _motion_emb last{_motion_emb[-1,:,:].shape}\n_motion_emb_res========{(_motion_emb[-1,:,:] - _motion_emb[0]).shape}")
-        # first_layer_motion_emb = _motion_emb[0]
-        # last_layer_motion_emb = _motion_emb[-1,:,:]
-        # motion_res = last_layer_motion_emb.permute(0, 2, 1) - first_layer_motion_emb.permute(0, 2, 1)
-        # print(f"motion_res===>{motion_res.shape}\n")
-        # motion_ids = motion_ids[..., 0]
-        m_length = m_length.cuda()
-        bs, seq = pose.shape[:2]
+        word_embeddings2, pos_one_hots2, clip_text2, sent_len2, pose2, m_length2, token2 = batch2
         
+        print(f"pose=======+>pose.shape: {pose.shape}")
+        pose = pose2.cuda()
+        motion_ids, _motion_emb = vq_model.encode(pose)
+        
+
+        m_length = m_length2.cuda()
+        bs, seq = pose.shape[:2]
+        refer_motion_clip_features = mogo_clip.encode_motion_code(motion_ids[:, :, 0]).to("cuda")
         # (b, seqlen)
         # m_length = m_length//4
-        all_pred_motions = trans.generate(clip_text, m_length, motion_ids, temperature=1)
+        # all_pred_motions = trans.generate(clip_text, m_length, motion_ids, temperature=1)
+        all_pred_motions = mogo_adapter.generate(clip_text, refer_motion_clip_features, m_length, trans, vq_model, motion_ids, scale=1)
         print(f"alllllll=======+>all_pred_motions.shape: {all_pred_motions.shape}")
         # motion_codes = motion_codes.permute(0, 2, 1)
         # mids.unsqueeze_(-1)
         # all_pred_motions = pad_tensor_list(all_pred_motions)
         # sampled_motions = all_pred_motions[:, ::2, :]
-        et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, all_pred_motions.clone(),
+        et_pred, em_pred = eval_wrapper.get_co_embeddings(word_embeddings2, pos_one_hots2, sent_len2, all_pred_motions.clone(),
                                                           m_length)
 
         pose = pose.cuda().float()
 
-        et, em = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
+        et, em = eval_wrapper.get_co_embeddings(word_embeddings2, pos_one_hots2, sent_len2, pose, m_length)
         motion_annotation_list.append(em)
         motion_pred_list.append(em_pred)
 
@@ -553,7 +569,7 @@ def evaluation_mask_transformer(out_dir, val_loader, trans, vq_model, writer, ep
     if save_anim:
         rand_idx = torch.randint(bs, (3,))
         data = all_pred_motions[rand_idx].detach().cpu().numpy()
-        captions = [clip_text[k] for k in rand_idx]
+        captions = [f"{clip_text[k]} \n === \n refer:{clip_text2[k]}" for k in rand_idx]
         lengths = m_length[rand_idx].cpu().numpy()
         save_dir = os.path.join(out_dir, 'animation', 'E%04d' % ep)
         os.makedirs(save_dir, exist_ok=True)

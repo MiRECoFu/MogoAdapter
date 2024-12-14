@@ -61,8 +61,8 @@ def get_opt(opt_path, device, **kwargs):
         opt.text_dir = pjoin(opt.data_root, 'texts')
         opt.joints_num = 22
         opt.dim_pose = 263
-        opt.max_motion_length = 196
-        opt.max_motion_frame = 196
+        opt.max_motion_length = 210
+        opt.max_motion_frame = 210
         opt.max_motion_token = 55
     elif opt.dataset_name == 'kit':
         opt.data_root = './dataset/KIT-ML/'
@@ -70,8 +70,8 @@ def get_opt(opt_path, device, **kwargs):
         opt.text_dir = pjoin(opt.data_root, 'texts')
         opt.joints_num = 21
         opt.dim_pose = 251
-        opt.max_motion_length = 196
-        opt.max_motion_frame = 196
+        opt.max_motion_length = 210
+        opt.max_motion_frame = 210
         opt.max_motion_token = 55
     else:
         raise KeyError('Dataset not recognized')

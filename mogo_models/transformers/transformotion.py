@@ -6,10 +6,10 @@ import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 
 # from models.transformers.token_embedding import MixEmbedding
-from mogo_models.transformers.tools import *
 from einops import rearrange, repeat, reduce
 from einops_exts import rearrange_with_anon_dims
 # from mogo_models.transformers.transformer_decoder import TransformerDecoder, TransformerEncoder
+from mogo_models.transformers.tools import *
 from mogo_models.transformers.transformer_xl_decoder import TrmXLDecoder
 import clip
 from torch.distributions.categorical import Categorical
@@ -308,6 +308,8 @@ class Transformotion(nn.Module):
             # loss = loss.float().mean().type_as(loss)
             return ce_loss, acc, pred_id, out, logits
         else:
+            if has_adapter is True:
+                return out, all_attends_out
             return out
 
 

@@ -1,28 +1,35 @@
-import clip
 import os
 import torch
 import numpy as np
 import sys
-from os.path import join as pjoin
+
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from os.path import join as pjoin
 current_dir = os.path.dirname(os.path.abspath(__file__))
+
 # 将项目根目录添加到 Python 路径中
 sys.path.append(os.path.join(current_dir, '..'))
-from motion_vae.model import RVQVAE
-from options.train_opt import TrainT2MOptions
-from utils.get_opt import get_opt
-from utils.paramUtil import t2m_kinematic_chain
-from utils.util import *
-from data_process.motion_dataset import Text2MotionDataset
+from models.trainer import Trainer
 from mogo_clip_models.mogo_clip import MogoClip
 from mogo_models.transformers.transformotion import Transformotion
 from models.mogo_adapter import MogoAdapter
-from utils.motion_process import recover_from_ric
+from motion_vae.model import RVQVAE
+
+from options.train_opt import TrainT2MOptions
+
 from utils.plot_script import plot_3d_motion
+from utils.motion_process import recover_from_ric
+from utils.get_opt import get_opt
+from utils.fixseed import fixseed
+from utils.paramUtil import t2m_kinematic_chain, kit_kinematic_chain
+
+from data_process.motion_dataset import Text2MotionDataset
+from motion_loaders.dataset_motion_loader import get_dataset_motion_loader
+from models.t2m_eval_wrapper import EvaluatorModelWrapper
+from utils.util import *
 
 def plot_t2m(data, save_dir, captions, m_lengths):
-    data = dataset.inv_transform(data)
+    data = train_dataset.inv_transform(data)
 
     # print(ep_curves.shape)
     for i, (caption, joint_data) in enumerate(zip(captions, data)):
@@ -31,11 +38,11 @@ def plot_t2m(data, save_dir, captions, m_lengths):
         save_path = pjoin(save_dir, '%02d.mp4'%i)
         # print(joint.shape)
         plot_3d_motion(save_path, kinematic_chain, joint, title=caption, fps=20)
-
+        
 
 def load_vq_model():
     opt_path = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.vq_name, 'opt.txt')
-    vq_opt = get_opt(opt_path, "cuda")
+    vq_opt = get_opt(opt_path, opt.device)
     vq_model = RVQVAE(vq_opt,
                 dim_pose,
                 vq_opt.nb_code,
@@ -48,7 +55,7 @@ def load_vq_model():
                 vq_opt.dilation_growth_rate,
                 vq_opt.vq_act,
                 vq_opt.vq_norm)
-    ckpt = torch.load(pjoin(opt.checkpoints_dir, opt.dataset_name, opt.vq_name, 'model', 'net_best_fid.tar'),
+    ckpt = torch.load(pjoin(vq_opt.checkpoints_dir, vq_opt.dataset_name, vq_opt.name, 'model', 'net_best_fid.tar'),
                             map_location='cpu')
     model_key = 'vq_model' if 'vq_model' in ckpt else 'net'
     vq_model.load_state_dict(ckpt[model_key])
@@ -77,7 +84,6 @@ def load_mogo_clip():
     print(f'Loading mogo_clip {model_opt.mogo_clip_name} from epoch {ckpt["ep"]}!')
     return mogo_clip
 
-
 def load_trans_model(model_opt, which_model, vq_model, opt):
     clip_version = 'ViT-B/32'
     transformotion = Transformotion(code_dim=model_opt.code_dim, 
@@ -96,20 +102,37 @@ def load_trans_model(model_opt, which_model, vq_model, opt):
     return transformotion
 
 
+
 if __name__ == '__main__':
     parser = TrainT2MOptions()
     opt = parser.parse()
+    fixseed(opt.seed)
+
+    opt.device = torch.device("cpu" if opt.gpu_id == -1 else "cuda:" + str(opt.gpu_id))
+    torch.autograd.set_detect_anomaly(True)
+
+    opt.save_root = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
+    opt.model_dir = pjoin(opt.save_root, 'model')
+    # opt.meta_dir = pjoin(opt.save_root, 'meta')
+    opt.eval_dir = pjoin(opt.save_root, 'animation')
+    opt.log_dir = pjoin('./log/t2m/', opt.dataset_name, opt.name)
+
+    os.makedirs(opt.model_dir, exist_ok=True)
+    # os.makedirs(opt.meta_dir, exist_ok=True)
+    os.makedirs(opt.eval_dir, exist_ok=True)
+    os.makedirs(opt.log_dir, exist_ok=True)
+    
     opt.data_root = '/root/autodl-tmp/HumanML3D'
-    print(opt)
     opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+    opt.text_dir = pjoin(opt.data_root, 'texts')
     opt.joints_num = 22
     opt.max_motion_len = 55
-    opt.text_dir = pjoin(opt.data_root, 'texts')
     dim_pose = 263
     radius = 4
     fps = 20
     kinematic_chain = t2m_kinematic_chain
     dataset_opt_path = '/root/autodl-tmp/checkpoints/t2m/Comp_v6_KLD005/opt.txt'
+    
     opt.device = torch.device("cpu" if opt.gpu_id == -1 else "cuda:" + str(opt.gpu_id))
     root_dir = pjoin(opt.checkpoints_dir, opt.dataset_name, opt.name)
     model_dir = pjoin(root_dir, 'model')
@@ -119,8 +142,7 @@ if __name__ == '__main__':
     vq_opt_path = pjoin(opt.checkpoints_dir, opt.dataset_name, model_opt.vq_name, 'opt.txt')
     vq_opt = get_opt(vq_opt_path, device=opt.device)
     vq_model, vq_opt = load_vq_model()
-    print(vq_opt)
-    
+    opt.num_tokens = vq_opt.nb_code
     mogo_adapter = MogoAdapter(
         max_motion_length=opt.max_motion_length,
         layers=opt.layers,
@@ -134,6 +156,7 @@ if __name__ == '__main__':
         device=opt.device
     )
     mogo_adapter.to(opt.device)
+
     vq_model.to(opt.device)
     vq_model.eval()
     for param in vq_model.parameters():
@@ -153,56 +176,43 @@ if __name__ == '__main__':
     mogo_clip.eval()
     for param in mogo_clip.parameters():
         param.requires_grad = False
-    # print(vq_model)
-    
+
+    all_params = 0
+    pc_transformer = sum(param.numel() for param in mogo_adapter.parameters())
+
+    # print(t2m_transformer)
+    # print("Total parameters of t2m_transformer net: {:.2f}M".format(pc_transformer / 1000_000))
+    all_params += pc_transformer
+
+    print('Total parameters of all models: {:.2f}M'.format(all_params / 1000_000))
+
     mean = np.load(pjoin(opt.checkpoints_dir, opt.dataset_name, opt.vq_name, 'meta', 'mean.npy'))
     std = np.load(pjoin(opt.checkpoints_dir, opt.dataset_name, opt.vq_name, 'meta', 'std.npy'))
     
-    train_file = pjoin(opt.data_root, 'test.txt')
-    dataset = Text2MotionDataset(opt, mean, std, train_file)
+    train_split_file = pjoin(opt.data_root, 'train.txt')
+    val_split_file = pjoin(opt.data_root, 'val.txt')
+
+    train_dataset = Text2MotionDataset(opt, mean, std, train_split_file)
+    val_dataset = Text2MotionDataset(opt, mean, std, val_split_file)
+    print(f"================================================={len(train_dataset)}")
+    
     seed1 = 42
     seed2 = 623
     set_new_seed(seed1) 
-    loader1 = DataLoader(dataset, batch_size=32, num_workers=4, shuffle=True, drop_last=True)
-    set_new_seed(seed2)
-    loader2 = DataLoader(dataset, batch_size=32, num_workers=4, shuffle=True, drop_last=True)
-    for i, (batch_data, batch_data2) in enumerate(zip(loader1, loader2)):
-        captions, motions, m_lens = batch_data
-        
-        motions = motions.detach().float().to(opt.device)
-        code_idx, _motion_emb = vq_model.encode(motions)
-        motion_code = code_idx[:, :, 0]
-        batch_size = motions.shape[0]
-        
-        
-        rand_idx = torch.randint(batch_size, (3,))
-        data = motions[rand_idx].detach().cpu().numpy()
-        _captions = [captions[k] for k in rand_idx]
-        lengths = m_lens[rand_idx].cpu().numpy()
-        save_dir = os.path.join(out_dir, 'animation', 'T%04d' % 0)
-        os.makedirs(save_dir, exist_ok=True)
-        # print(lengths)
-        plot_t2m(data, save_dir, _captions, lengths)
-        
-        
-        positive_mean, negative_mean, separation = mogo_clip.mean_cosine_similarity(motion_code, captions)
-        motion_code_feature = mogo_clip.encode_motion_code(motion_code)
-        ce_loss, acc, pred_id, output, logits, all_attends_out = t2m_transformer(captions, code_idx, m_lens, code_idx.clone(), has_adapter=True)
-        
-        print(f"positive_mean1: {positive_mean} negative_mean1:{negative_mean}")
-        # print(f"motion_code_feature: {motion_code_feature} motion_code_feature shape: {motion_code_feature.shape}")
-        # print(f"mogo output: {all_attends_out.shape}")
-        
-        captions2, motions2, m_lens2 = batch_data2
-        motions2 = motions2.detach().float().to(opt.device)
-        code_idx2, _motion_emb2 = vq_model.encode(motions2)
-        motion_code2 = code_idx2[:, :, 0]
-        # batch_size = motions.shape[0]
-        positive_mean2, negative_mean2, separation2 = mogo_clip.mean_cosine_similarity(motion_code2, captions2)
-        input_motion_logits = all_attends_out.to(opt.device)
-        motion_code_feature2 = mogo_clip.encode_motion_code(motion_code2).to(opt.device)
-        text_feature2 = mogo_clip.encode_text(captions2).to(opt.device)
-        mogo_adapter(all_attends_out, motion_code_feature2)
-        print(f"positive_mean2: {positive_mean2} negative_mean1:{negative_mean2}")
-        if i == 5:
-            break
+
+    train_loader1 = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
+
+    eval_val_loader1, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)
+    set_new_seed(seed2) 
+    
+    train_loader2 = DataLoader(train_dataset, batch_size=opt.batch_size, num_workers=4, shuffle=True, drop_last=True)
+
+    eval_val_loader2, _ = get_dataset_motion_loader(dataset_opt_path, 32, 'val', device=opt.device)
+
+    wrapper_opt = get_opt(dataset_opt_path, torch.device('cuda'))
+    eval_wrapper = EvaluatorModelWrapper(wrapper_opt)
+    
+    trainer = Trainer(opt, t2m_transformer, vq_model, mogo_clip, mogo_adapter)
+    
+    trainer.train(train_loader1, train_loader2, val_loader, eval_val_loader1, eval_val_loader2, eval_wrapper=eval_wrapper, plot_eval=plot_t2m)

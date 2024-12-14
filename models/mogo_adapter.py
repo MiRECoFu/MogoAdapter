@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 import clip
+from mogo_models.transformers.tools import *
 # from tools import *
 
 class LayerNorm(nn.LayerNorm):
@@ -23,7 +24,7 @@ class QuickGELU(nn.Module):
     
     
 class ResidualCrossAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, device, attn_mask: torch.Tensor = None):
+    def __init__(self, d_model: int, n_head: int, device):
         super().__init__()
 
         # Cross-attention: Query comes from target (x), key and value come from source (y)
@@ -37,12 +38,19 @@ class ResidualCrossAttentionBlock(nn.Module):
             ("dropout", nn.Dropout(p=0.1))
         ])).to(device)
         self.ln_2 = nn.LayerNorm(d_model).to(device)
-        self.attn_mask = attn_mask
+        # self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor, y: torch.Tensor):
         """x is the query (target input), y is the key and value (source input)."""
-        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, y, y, need_weights=False, attn_mask=self.attn_mask)[0]
+        attn_mask = self.build_attention_mask(x).to(dtype=x.dtype, device=x.device)
+        return self.attn(x, y, y, need_weights=False, attn_mask=attn_mask)[0]
+    
+    def build_attention_mask(self, x: torch.Tensor):
+        # pytorch uses additive attention mask; fill with -inf
+        mask = torch.empty(x.shape[0], x.shape[0]).to(x.device)
+        mask.fill_(float("-inf"))
+        mask.triu_(1)  # zero out the lower diagonal
+        return mask
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
         """
@@ -58,11 +66,11 @@ class ResidualCrossAttentionBlock(nn.Module):
         return x
     
 class Transformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, device, attn_mask: torch.Tensor = None):
+    def __init__(self, width: int, layers: int, heads: int, device):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = [ResidualCrossAttentionBlock(width, heads, device, attn_mask) for _ in range(layers)]
+        self.resblocks = [ResidualCrossAttentionBlock(width, heads, device) for _ in range(layers)]
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
         for resblock in self.resblocks:
@@ -109,7 +117,7 @@ class MogoAdapter(nn.Module):
                 layers=cur_layers,
                 heads=cur_heads,
                 device=device,
-                attn_mask=self.build_attention_mask(),
+                # attn_mask=self.build_attention_mask(),
             ).to(self.device)
             self.trms.append(trm)
             
@@ -136,16 +144,19 @@ class MogoAdapter(nn.Module):
                 nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
                 nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
                 nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+                
+    def parameters(self):
+        return [p for name, p in self.named_parameters()]
 
     
-    def build_attention_mask(self):
-        # pytorch uses additive attention mask; fill with -inf
-        mask = torch.empty(self.max_motion_length, self.max_motion_length).to(self.device)
-        mask.fill_(float("-inf"))
-        mask.triu_(1)  # zero out the lower diagonal
-        return mask
+    # def build_attention_mask(self):
+    #     # pytorch uses additive attention mask; fill with -inf
+    #     mask = torch.empty(self.max_motion_length, self.max_motion_length).to(self.device)
+    #     mask.fill_(float("-inf"))
+    #     mask.triu_(1)  # zero out the lower diagonal
+    #     return mask
     
-    def forward(self, input_motion_logits, refer_text_features, refer_motion_clip_features, scale=1, is_generate=False):
+    def forward(self, input_motion_logits, refer_motion_clip_features, scale=1):
         bs, m_len, motion_dim, q = input_motion_logits.shape
         refer_motion_features = self.cond_emb(refer_motion_clip_features)
         refer_motion_features = refer_motion_features.unsqueeze(1).unsqueeze(-1)
@@ -159,6 +170,7 @@ class MogoAdapter(nn.Module):
             att = transformer(input_motion_layer_logits, refer_motion_layer_features)
             res_feat = scale * att + input_motion_layer_logits
             att = att.permute(1, 0, 2)
+            res_feat = res_feat.permute(1, 0, 2)
             out = self.head(res_feat)
             res_atts.append(res_feat)
             all_out.append(out)
@@ -167,5 +179,40 @@ class MogoAdapter(nn.Module):
         # print(f"res_features res: {res_features}, {res_features.shape}, res_all_out: {res_all_out}, {res_all_out.shape}")
         return res_features, res_all_out
     
-    def generate(self):
-        pass
+    @torch.no_grad()
+    @eval_decorator
+    def generate(self, prompt_texts, refer_motion_clip_features, m_lens, transformotion, vq_model, labels=None, scale=1):
+
+        self.eval()
+        for ind, trm in enumerate(self.trms):
+            trm.eval()
+        seq_len = max(m_lens).to(self.device)
+        batch_size = len(m_lens)
+        if labels is None:
+            labels = torch.zeros(batch_size, seq_len, 6)
+            
+        res_seq_ids = []
+        
+        generated = torch.empty(batch_size, 0, self.mogo_q_layers, dtype=torch.long).to(self.device)
+        for k in range(seq_len):
+            out, all_attends_out = transformotion(prompt_texts, generated, m_lens, labels=labels[:, k:k+1], mems=None, is_generating=True, has_adapter=True)
+            res_features, res_all_out = self.forward(all_attends_out, refer_motion_clip_features, scale=scale)
+            logits = res_all_out.permute(0, 1, 3, 2)
+            probs = F.softmax(logits[:,-1,:, :], dim=-1)  # (b, seqlen, ntoken)
+            dist = Categorical(probs)
+            pred_ids = dist.sample()
+            pred_ids = pred_ids.unsqueeze(1)
+            res_seq_ids.append(pred_ids)
+            generated = torch.cat(res_seq_ids, dim=1)
+        motion_ids = torch.cat(res_seq_ids, dim=1).to(self.device)
+        print(f"motion motion_ids ========================+> {motion_ids}\n labels====> {labels}")
+        # gathered_ids = repeat(motion_ids.unsqueeze(-1), 'b n -> b n d', d=6)
+        pred_motions = vq_model.forward_decoder(motion_ids)
+        # print(f"motion pred_motions ========================+> {pred_motions.shape}\n labels========================+> {labels.shape}")
+        for ind, trm in enumerate(self.trms):
+            trm.train()
+        # self.seqTransDecoderXL.train()
+    
+        return pred_motions
+        
+

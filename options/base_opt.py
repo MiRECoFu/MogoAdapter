@@ -20,7 +20,7 @@ class BaseOptions():
 
         self.parser.add_argument('--embed_dim', type=int, default=768, help='Dimension of transformer latent.')
         self.parser.add_argument('--heads', type=int, default=8, help='Number of heads.')
-        self.parser.add_argument('--layers', type=int, default=8, help='Number of attention layers.')
+        self.parser.add_argument('--layers', type=int, default=10, help='Number of attention layers.')
         self.parser.add_argument('--width', type=int, default=1024, help='FF_Size')
         self.parser.add_argument('--mogo_clip_embed_dim', type=int, default=768, help='Dimension of transformer latent.')
         self.parser.add_argument('--mogo_clip_heads', type=int, default=16, help='Number of heads.')
