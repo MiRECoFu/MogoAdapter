@@ -143,19 +143,7 @@ if __name__ == '__main__':
     vq_opt = get_opt(vq_opt_path, device=opt.device)
     vq_model, vq_opt = load_vq_model()
     opt.num_tokens = vq_opt.nb_code
-    mogo_adapter = MogoAdapter(
-        max_motion_length=opt.max_motion_length,
-        layers=opt.layers,
-        heads=opt.heads,
-        width=opt.width,
-        mogo_clip_embed_dim=opt.mogo_clip_embed_dim,
-        mogo_dim=1024,
-        mogo_q_layers=6,
-        scale=1,
-        num_tokens=vq_opt.nb_code,
-        device=opt.device
-    )
-    mogo_adapter.to(opt.device)
+    
 
     vq_model.to(opt.device)
     vq_model.eval()
@@ -170,6 +158,21 @@ if __name__ == '__main__':
     t2m_transformer.eval()
     for param in t2m_transformer.parameters():
         param.requires_grad = False
+    
+    mogo_adapter = MogoAdapter(
+        max_motion_length=opt.max_motion_length,
+        layers=opt.layers,
+        heads=opt.heads,
+        width=opt.width,
+        mogo_clip_embed_dim=opt.mogo_clip_embed_dim,
+        mogo_dim=1024,
+        mogo_q_layers=6,
+        scale=1,
+        num_tokens=vq_opt.nb_code,
+        # mogo=t2m_transformer,
+        device=opt.device
+    )
+    mogo_adapter.to(opt.device)
     
     mogo_clip = load_mogo_clip()
     mogo_clip.to(opt.device)

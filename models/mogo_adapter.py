@@ -7,6 +7,10 @@ import torch.nn.functional as F
 from torch import nn
 import clip
 from mogo_models.transformers.tools import *
+from models.qna import *
+# from diffusion.nn import (
+#     normalization,
+# )
 # from tools import *
 
 class LayerNorm(nn.LayerNorm):
@@ -65,16 +69,67 @@ class ResidualCrossAttentionBlock(nn.Module):
         
         return x
     
+
+    
+# use qna attention block
+class AttentionBlock(nn.Module):
+    def __init__(
+            self,
+            channels,
+            num_heads=1,
+            use_new_attention_order=False,
+            use_qna=True,
+            kernel_size=3,
+            device=torch.device("cuda")
+            ):
+        super().__init__()
+        self.channels = channels
+        self.use_qna = use_qna
+        self.num_heads = num_heads
+        self.norm = nn.InstanceNorm1d(channels, affine=True)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(channels, channels * 2)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(channels * 2, channels)),
+            ("dropout", nn.Dropout(p=0.1))
+        ])).to(device)
+        self.norm_2 = nn.InstanceNorm1d(channels, affine=True)
+        # TODO not use qna
+        if use_qna:
+            self.attention = FusedQnA1d(
+                in_features=self.channels,
+                timesteps_features=None,
+                hidden_features=self.channels,
+                heads=self.num_heads,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=(kernel_size - 1) // 2,
+            )
+    
+    def forward(self, q, x, scale=1):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        q = q.reshape(b, c, -1)
+        h = self.norm(x).reshape(b, c, 1, -1)
+        h = self.attention(h, input_q=q)
+        h = h.reshape(b, c, -1)
+        # print(f"h============{h.shape}")
+        h = self.mlp(self.norm_2(h).permute(0, 2, 1)).permute(0, 2, 1)
+        return (x + scale * h).reshape(b, c, *spatial)
+    
+
+    
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, device):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = [ResidualCrossAttentionBlock(width, heads, device) for _ in range(layers)]
+        # self.resblocks = [ResidualCrossAttentionBlock(width, heads, device) for _ in range(layers)]
+        self.resblocks = nn.ModuleList([AttentionBlock(width, num_heads=heads, device=device) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, q: torch.Tensor, x: torch.Tensor, scale=1):
         for resblock in self.resblocks:
-            x = resblock(x, y) 
+            x = resblock(q, x, scale) 
         return x
     
     
@@ -106,26 +161,20 @@ class MogoAdapter(nn.Module):
         self.heads = heads
         
         self.scale = scale
-
-        self.trms = nn.ModuleList([])
         
-        for i in range(mogo_q_layers):
-            cur_heads = self.heads // (i + 1)
-            cur_layers = self.layers // (i + 1)
-            trm = Transformer(
-                width=width,
-                layers=cur_layers,
-                heads=cur_heads,
-                device=device,
-                # attn_mask=self.build_attention_mask(),
-            ).to(self.device)
-            self.trms.append(trm)
+        self.transformer = Transformer(
+            width=width,
+            layers=self.layers,
+            heads = self.heads,
+            device = device
+        ).to(self.device)
             
         
         
         self.positional_embedding = nn.Parameter(torch.empty(self.max_motion_length, width))
         self.ln_final = LayerNorm(width)
         self.cond_emb = nn.Linear(self.mogo_clip_embed_dim, self.mogo_dim)
+        self.input_emb = nn.Linear(self.mogo_dim, self.mogo_dim)
         self.head = nn.Linear(self.mogo_dim, self.num_tokens, bias=False) 
         self.initialize_parameters()
         
@@ -133,59 +182,45 @@ class MogoAdapter(nn.Module):
         nn.init.normal_(self.positional_embedding, std=0.01)
         
         nn.init.normal_(self.cond_emb.weight, std=(2 * self.mogo_dim) ** -0.5)
+        # nn.init.normal_(self.input_emb.weight, std=(2 * self.mogo_dim) ** -0.5)
         nn.init.normal_(self.head.weight, std=(2 * self.mogo_dim) ** -0.5)
         
         proj_std = (self.width ** -0.5) * ((2 * self.layers) ** -0.5)
         attn_std = self.width ** -0.5
         fc_std = (2 * self.width) ** -0.5
-        for transformer in self.trms:
-            for block in transformer.resblocks:
-                nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-                nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+        for block in self.transformer.resblocks:
+                # nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+                # nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
                 nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
                 nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
                 
     def parameters(self):
-        return [p for name, p in self.named_parameters()]
+        return [p for name, p in self.named_parameters() if not name.startswith('mogo.')]
 
     
-    # def build_attention_mask(self):
-    #     # pytorch uses additive attention mask; fill with -inf
-    #     mask = torch.empty(self.max_motion_length, self.max_motion_length).to(self.device)
-    #     mask.fill_(float("-inf"))
-    #     mask.triu_(1)  # zero out the lower diagonal
-    #     return mask
-    
     def forward(self, input_motion_logits, refer_motion_clip_features, scale=1):
-        bs, m_len, motion_dim, q = input_motion_logits.shape
+        # print(f"input_motion_logits.shape==={input_motion_logits.shape}")
+        bs, m_len, q, motion_dim = input_motion_logits.shape
         refer_motion_features = self.cond_emb(refer_motion_clip_features)
-        refer_motion_features = refer_motion_features.unsqueeze(1).unsqueeze(-1)
-        refer_motion_features = refer_motion_features.repeat(1, m_len, 1, q).type(input_motion_logits.dtype).to(self.device)
-        # print(f"refer_motion_features: {refer_motion_features} {refer_motion_features.shape} input_motion_logits: {input_motion_logits.shape}")
-        res_atts = []
+        input_motion_logits = self.input_emb(input_motion_logits).permute(0, 1, 3, 2)
+        input_motion_logits = input_motion_logits.permute(0, 2, 1, 3)
+        att = self.transformer(refer_motion_features, input_motion_logits, scale=scale)
+        att = att.permute(0, 2, 1, 3)
         all_out = []
-        for ind, transformer in enumerate(self.trms):
-            input_motion_layer_logits = input_motion_logits[:, :, :, ind].permute(1, 0, 2)
-            refer_motion_layer_features = refer_motion_features[:, :, :, ind].permute(1, 0, 2)
-            att = transformer(input_motion_layer_logits, refer_motion_layer_features)
-            res_feat = scale * att + input_motion_layer_logits
-            att = att.permute(1, 0, 2)
-            res_feat = res_feat.permute(1, 0, 2)
+        for ind in range(self.mogo_q_layers):
+            res_feat = att[:, :, :, ind]
             out = self.head(res_feat)
-            res_atts.append(res_feat)
             all_out.append(out)
-        res_features = torch.stack(res_atts, dim=-1)
         res_all_out = torch.stack(all_out, dim=-1)
-        # print(f"res_features res: {res_features}, {res_features.shape}, res_all_out: {res_all_out}, {res_all_out.shape}")
-        return res_features, res_all_out
+
+        return att, res_all_out
     
     @torch.no_grad()
     @eval_decorator
     def generate(self, prompt_texts, refer_motion_clip_features, m_lens, transformotion, vq_model, labels=None, scale=1):
 
         self.eval()
-        for ind, trm in enumerate(self.trms):
-            trm.eval()
+        
         seq_len = max(m_lens).to(self.device)
         batch_size = len(m_lens)
         if labels is None:
@@ -196,6 +231,7 @@ class MogoAdapter(nn.Module):
         generated = torch.empty(batch_size, 0, self.mogo_q_layers, dtype=torch.long).to(self.device)
         for k in range(seq_len):
             out, all_attends_out = transformotion(prompt_texts, generated, m_lens, labels=labels[:, k:k+1], mems=None, is_generating=True, has_adapter=True)
+            all_attends_out = all_attends_out.permute(0, 1, 3, 2)
             res_features, res_all_out = self.forward(all_attends_out, refer_motion_clip_features, scale=scale)
             logits = res_all_out.permute(0, 1, 3, 2)
             probs = F.softmax(logits[:,-1,:, :], dim=-1)  # (b, seqlen, ntoken)
@@ -209,8 +245,6 @@ class MogoAdapter(nn.Module):
         # gathered_ids = repeat(motion_ids.unsqueeze(-1), 'b n -> b n d', d=6)
         pred_motions = vq_model.forward_decoder(motion_ids)
         # print(f"motion pred_motions ========================+> {pred_motions.shape}\n labels========================+> {labels.shape}")
-        for ind, trm in enumerate(self.trms):
-            trm.train()
         # self.seqTransDecoderXL.train()
     
         return pred_motions

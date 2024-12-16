@@ -11,6 +11,7 @@ from models.tools import *
 import time
 from einops import rearrange, repeat
 import wandb
+import random
 
 def def_value():
     return 0.0
@@ -69,26 +70,32 @@ class Trainer:
         
     def forward(self, batch_data1, batch_data2):
 
-        captions1, motions1, m_lens1 = batch_data1
+        _captions1, motions1, m_lens1 = batch_data1
         m_lens1 = m_lens1.detach().long().to(self.device)
         # captions = captions.to(self.device)
+        batch_size = motions1.shape[0]
         motions1 = motions1.detach().float().to(self.device)
         code_idx1, _motion_emb1 = self.vq_model.encode(motions1)
-        
+        # captions1 = [random.choice(["A person", "A person is moving", "A person is standing", "A person is walking"]) for _ in range(batch_size)]
+        # captions1 = [" "] * batch_size
+        # print(captions1)
 
-        _ce_loss, _acc, pred_id, output, logits, all_attends_out = self.transformotion(captions1, code_idx1, m_lens1, code_idx1.clone(), has_adapter=True)
+        # _ce_loss, _acc, _pred_id, output, logits, all_attends_out = self.transformotion(captions1, code_idx1, m_lens1, code_idx1.clone(), has_adapter=True)
 
         captions2, motions2, m_lens2 = batch_data2
-        wandb.log({"Train/loss": ce_loss, "Train/acc": acc})
+        
         motions2 = motions2.detach().float().to(self.device)
         code_idx2, _motion_emb2 = self.vq_model.encode(motions2)
         refer_label = code_idx2.clone()
         motion_code2 = code_idx2[:, :, 0]
         # batch_size = motions.shape[0]
-        input_motion_logits = all_attends_out.to(self.device)
+        # input_motion_logits = all_attends_out.to(self.device)
+        input_motion_logits = self.transformotion.tok_emb(code_idx1)
+        # input_motion_logits = input_motion_logits.permute(0, 1, 3, 2) # (b, len, dim, q)
         motion_code_feature2 = self.mogo_clip.encode_motion_code(motion_code2).to(self.device)
         res_features, res_all_out = self.mogo_adapter(input_motion_logits, motion_code_feature2)
         ce_loss, pred_id, acc = cal_performance(res_all_out, refer_label, m_lens2, self.pad_id)
+        wandb.log({"Train/loss": ce_loss, "Train/acc": acc})
         return ce_loss, acc
     
     def update(self, batch_data1, batch_data2):
@@ -137,14 +144,14 @@ class Trainer:
         print(f'Total Epochs: {self.opt.max_epoch}, Total Iters: {total_iters}')
         print('Iters Per Epoch, Training: %04d, Validation: %03d' % (len(train_loader1), len(val_loader)))
         logs = defaultdict(def_value, OrderedDict())
-        best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = evaluation_mask_transformer(
-            self.opt.save_root, eval_val_loader1, eval_val_loader2, self.transformotion, self.vq_model, self.mogo_adapter, self.mogo_clip, self.logger, epoch,
-            best_fid=100, best_div=100,
-            best_top1=0, best_top2=0, best_top3=0,
-            best_matching=100, eval_wrapper=eval_wrapper,
-            plot_func=plot_eval, save_ckpt=False, save_anim=True
-        )
-        # best_fid, best_div, best_top1, best_top2, best_top3, best_matching = 100, 100, 0, 0, 0, 100
+        # best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = evaluation_mask_transformer(
+        #     self.opt.save_root, eval_val_loader1, eval_val_loader2, self.transformotion, self.vq_model, self.mogo_adapter, self.mogo_clip, self.logger, epoch,
+        #     best_fid=100, best_div=100,
+        #     best_top1=0, best_top2=0, best_top3=0,
+        #     best_matching=100, eval_wrapper=eval_wrapper,
+        #     plot_func=plot_eval, save_ckpt=False, save_anim=True
+        # )
+        best_fid, best_div, best_top1, best_top2, best_top3, best_matching = 100, 100, 0, 0, 0, 100
         best_acc = 0.
         while epoch < self.opt.max_epoch:
             self.transformotion.eval()
@@ -176,11 +183,11 @@ class Trainer:
             self.save(pjoin(self.opt.model_dir, 'latest.tar'), epoch, it)
             epoch += 1
             
-            if epoch % 10 == 0 or epoch == 1:
+            if epoch % 20 == 0 or epoch == 1:
                 best_fid, best_div, best_top1, best_top2, best_top3, best_matching, writer = evaluation_mask_transformer(
                     self.opt.save_root, eval_val_loader1, eval_val_loader2, self.transformotion, self.vq_model, self.mogo_adapter, self.mogo_clip, self.logger, epoch,
-                    best_fid=100, best_div=100,
-                    best_top1=0, best_top2=0, best_top3=0,
-                    best_matching=100, eval_wrapper=eval_wrapper,
+                    best_fid=best_fid, best_div=best_div,
+                    best_top1=best_top1, best_top2=best_top2, best_top3=best_top3,
+                    best_matching=best_matching, eval_wrapper=eval_wrapper,
                     plot_func=plot_eval, save_ckpt=False, save_anim=True
                 )

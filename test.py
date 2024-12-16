@@ -121,6 +121,18 @@ if __name__ == '__main__':
     vq_model, vq_opt = load_vq_model()
     print(vq_opt)
     
+ 
+    vq_model.to(opt.device)
+    vq_model.eval()
+    for param in vq_model.parameters():
+        param.requires_grad = False
+    
+    model_opt.num_tokens = vq_opt.nb_code
+    model_opt.num_quantizers = vq_opt.num_quantizers
+    model_opt.code_dim = vq_opt.code_dim
+    t2m_transformer = load_trans_model(model_opt, 'latest.tar', vq_model=vq_model, opt=opt)
+    t2m_transformer.to(opt.device)
+    t2m_transformer.eval()
     mogo_adapter = MogoAdapter(
         max_motion_length=opt.max_motion_length,
         layers=opt.layers,
@@ -134,17 +146,6 @@ if __name__ == '__main__':
         device=opt.device
     )
     mogo_adapter.to(opt.device)
-    vq_model.to(opt.device)
-    vq_model.eval()
-    for param in vq_model.parameters():
-        param.requires_grad = False
-    
-    model_opt.num_tokens = vq_opt.nb_code
-    model_opt.num_quantizers = vq_opt.num_quantizers
-    model_opt.code_dim = vq_opt.code_dim
-    t2m_transformer = load_trans_model(model_opt, 'latest.tar', vq_model=vq_model, opt=opt)
-    t2m_transformer.to(opt.device)
-    t2m_transformer.eval()
     for param in t2m_transformer.parameters():
         param.requires_grad = False
     
@@ -163,9 +164,9 @@ if __name__ == '__main__':
     seed1 = 42
     seed2 = 623
     set_new_seed(seed1) 
-    loader1 = DataLoader(dataset, batch_size=32, num_workers=4, shuffle=True, drop_last=True)
+    loader1 = DataLoader(dataset, batch_size=24, num_workers=4, shuffle=True, drop_last=True)
     set_new_seed(seed2)
-    loader2 = DataLoader(dataset, batch_size=32, num_workers=4, shuffle=True, drop_last=True)
+    loader2 = DataLoader(dataset, batch_size=24, num_workers=4, shuffle=True, drop_last=True)
     for i, (batch_data, batch_data2) in enumerate(zip(loader1, loader2)):
         captions, motions, m_lens = batch_data
         
@@ -174,15 +175,17 @@ if __name__ == '__main__':
         motion_code = code_idx[:, :, 0]
         batch_size = motions.shape[0]
         
-        
-        rand_idx = torch.randint(batch_size, (3,))
-        data = motions[rand_idx].detach().cpu().numpy()
-        _captions = [captions[k] for k in rand_idx]
-        lengths = m_lens[rand_idx].cpu().numpy()
-        save_dir = os.path.join(out_dir, 'animation', 'T%04d' % 0)
-        os.makedirs(save_dir, exist_ok=True)
-        # print(lengths)
-        plot_t2m(data, save_dir, _captions, lengths)
+        motion_emb =t2m_transformer.tok_emb(code_idx)
+        print(f"motion_emb: ==================>{motion_emb.shape}")
+        # motion_emb = motion_emb.permute(0, 1, 3, 2)
+        # rand_idx = torch.randint(batch_size, (3,))
+        # data = motions[rand_idx].detach().cpu().numpy()
+        # _captions = [captions[k] for k in rand_idx]
+        # lengths = m_lens[rand_idx].cpu().numpy()
+        # save_dir = os.path.join(out_dir, 'animation', 'T%04d' % 0)
+        # os.makedirs(save_dir, exist_ok=True)
+        # # print(lengths)
+        # plot_t2m(data, save_dir, _captions, lengths)
         
         
         positive_mean, negative_mean, separation = mogo_clip.mean_cosine_similarity(motion_code, captions)
@@ -200,9 +203,11 @@ if __name__ == '__main__':
         # batch_size = motions.shape[0]
         positive_mean2, negative_mean2, separation2 = mogo_clip.mean_cosine_similarity(motion_code2, captions2)
         input_motion_logits = all_attends_out.to(opt.device)
+        print(f"input_motion_logits============={input_motion_logits.shape}")
         motion_code_feature2 = mogo_clip.encode_motion_code(motion_code2).to(opt.device)
         text_feature2 = mogo_clip.encode_text(captions2).to(opt.device)
-        mogo_adapter(all_attends_out, motion_code_feature2)
+        att, res_all_out = mogo_adapter(motion_emb, motion_code_feature2)
         print(f"positive_mean2: {positive_mean2} negative_mean1:{negative_mean2}")
+        print(f"att: {att.shape} res_all_out:{res_all_out.shape}")
         if i == 5:
             break

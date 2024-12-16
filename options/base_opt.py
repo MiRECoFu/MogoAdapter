@@ -8,7 +8,7 @@ class BaseOptions():
         self.initialized = False
 
     def initialize(self):
-        self.parser.add_argument('--name', type=str, default="mogo_adapter_1212", help='Mogo Adapter Name of this trial')
+        self.parser.add_argument('--name', type=str, default="mogo_adapter_1216", help='Mogo Adapter Name of this trial')
         self.parser.add_argument('--mogo_name', type=str, default="trm_xl_b44_d1024_1025_clip_nh16_nl18.14_downt_1_r_w_cmp", help='Mogo Name of this trial')
         self.parser.add_argument('--mogo_clip_name', type=str, default="mogo_clip_768_1207", help='Mogo Clip Name of this trial')
 
@@ -19,8 +19,8 @@ class BaseOptions():
         self.parser.add_argument('--checkpoints_dir', type=str, default='/root/autodl-tmp/checkpoints', help='models are saved here.')
 
         self.parser.add_argument('--embed_dim', type=int, default=768, help='Dimension of transformer latent.')
-        self.parser.add_argument('--heads', type=int, default=8, help='Number of heads.')
-        self.parser.add_argument('--layers', type=int, default=10, help='Number of attention layers.')
+        self.parser.add_argument('--heads', type=int, default=16, help='Number of heads.')
+        self.parser.add_argument('--layers', type=int, default=8, help='Number of attention layers.')
         self.parser.add_argument('--width', type=int, default=1024, help='FF_Size')
         self.parser.add_argument('--mogo_clip_embed_dim', type=int, default=768, help='Dimension of transformer latent.')
         self.parser.add_argument('--mogo_clip_heads', type=int, default=16, help='Number of heads.')
