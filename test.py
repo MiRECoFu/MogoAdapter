@@ -164,9 +164,9 @@ if __name__ == '__main__':
     seed1 = 42
     seed2 = 623
     set_new_seed(seed1) 
-    loader1 = DataLoader(dataset, batch_size=24, num_workers=4, shuffle=True, drop_last=True)
+    loader1 = DataLoader(dataset, batch_size=12, num_workers=4, shuffle=True, drop_last=True)
     set_new_seed(seed2)
-    loader2 = DataLoader(dataset, batch_size=24, num_workers=4, shuffle=True, drop_last=True)
+    loader2 = DataLoader(dataset, batch_size=12, num_workers=4, shuffle=True, drop_last=True)
     for i, (batch_data, batch_data2) in enumerate(zip(loader1, loader2)):
         captions, motions, m_lens = batch_data
         

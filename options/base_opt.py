@@ -8,7 +8,7 @@ class BaseOptions():
         self.initialized = False
 
     def initialize(self):
-        self.parser.add_argument('--name', type=str, default="mogo_adapter_1216", help='Mogo Adapter Name of this trial')
+        self.parser.add_argument('--name', type=str, default="mogo_adapter_1218", help='Mogo Adapter Name of this trial')
         self.parser.add_argument('--mogo_name', type=str, default="trm_xl_b44_d1024_1025_clip_nh16_nl18.14_downt_1_r_w_cmp", help='Mogo Name of this trial')
         self.parser.add_argument('--mogo_clip_name', type=str, default="mogo_clip_768_1207", help='Mogo Clip Name of this trial')
 

@@ -112,7 +112,7 @@ class Trainer:
     
     def resume(self, model_dir):
         checkpoint = torch.load(model_dir, map_location=self.device)
-        missing_keys, unexpected_keys = self.transformotion.load_state_dict(checkpoint['mogo_adapter'], strict=False)
+        missing_keys, unexpected_keys = self.mogo_adapter.load_state_dict(checkpoint['mogo_adapter'], strict=False)
         assert len(unexpected_keys) == 0
         # assert all([k.startswith('clip_model.') for k in missing_keys])
 
@@ -129,7 +129,7 @@ class Trainer:
         self.vq_model.to(self.device)
         self.mogo_clip.to(self.device)
 
-        self.opt_mogo_adapter = optim.AdamW(self.mogo_adapter.parameters(), lr=self.opt.lr, weight_decay=0.01)
+        self.opt_mogo_adapter = optim.AdamW(self.mogo_adapter.parameters(), lr=self.opt.lr, weight_decay=0.0)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.opt_mogo_adapter,
                                         800000, eta_min=3e-6)
         epoch = 0

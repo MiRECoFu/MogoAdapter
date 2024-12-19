@@ -3,15 +3,49 @@ from typing import Tuple, Union
 
 import numpy as np
 import torch
+import torch as th
 import torch.nn.functional as F
 from torch import nn
 import clip
 from mogo_models.transformers.tools import *
 from models.qna import *
-# from diffusion.nn import (
-#     normalization,
-# )
-# from tools import *
+from models.tools import *
+
+
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+class GroupNorm32(nn.GroupNorm):
+    def forward(self, x):
+        return super().forward(x.float()).type(x.dtype)
+    
+def normalization(channels):
+    """
+    Make a standard normalization layer.
+
+    :param channels: number of input channels.
+    :return: an nn.Module for normalization.
+    """
+    return GroupNorm32(32, channels)
+    
+
+def conv_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
@@ -69,7 +103,111 @@ class ResidualCrossAttentionBlock(nn.Module):
         
         return x
     
+class ResBlock(nn.Module):
+    """
+    A residual block that can optionally change the number of channels.
 
+    :param channels: the number of input channels.
+    :param emb_channels: the number of timestep embedding channels.
+    :param dropout: the rate of dropout.
+    :param out_channels: if specified, the number of out channels.
+    :param use_conv: if True and out_channels is specified, use a spatial
+        convolution instead of a smaller 1x1 convolution to change the
+        channels in the skip connection.
+    :param dims: determines if the signal is 1D, 2D, or 3D.
+    :param use_checkpoint: if True, use gradient checkpointing on this module.
+    :param up: if True, use this block for upsampling.
+    :param down: if True, use this block for downsampling.
+    """
+
+    def __init__(
+        self,
+        channels,
+        emb_channels,
+        dropout,
+        out_channels=None,
+        use_conv=False,
+        use_scale_shift_norm=False,
+        dims=2,
+        use_checkpoint=False,
+        up=False,
+        down=False,
+        padding_mode='zeros',
+        padding=1
+    ):
+        super().__init__()
+        self.channels = channels
+        self.emb_channels = emb_channels
+        self.dropout = dropout
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.use_checkpoint = use_checkpoint
+        self.use_scale_shift_norm = use_scale_shift_norm
+
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(dims, channels, self.out_channels, 3, padding=padding, padding_mode=padding_mode),
+        )
+
+        self.updown = up or down
+
+        if up:
+            self.h_upd = Upsample(channels, False, dims, padding_mode=padding_mode, padding=padding)
+            self.x_upd = Upsample(channels, False, dims, padding_mode=padding_mode, padding=padding)
+        elif down:
+            self.h_upd = Downsample(channels, False, dims, padding_mode=padding_mode, padding=padding)
+            self.x_upd = Downsample(channels, False, dims, padding_mode=padding_mode, padding=padding)
+        else:
+            self.h_upd = self.x_upd = nn.Identity()
+
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            linear(
+                emb_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+            ),
+        )
+        self.out_layers = nn.Sequential(
+            normalization(self.out_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            zero_module(
+                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=padding, padding_mode=padding_mode)
+            ),
+        )
+
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = conv_nd(
+                dims, channels, self.out_channels, 3, padding=padding, padding_mode=padding_mode
+            )
+        else:
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+
+
+    def forward(self, x, emb):
+        if self.updown:
+            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
+        emb_out = self.emb_layers(emb).type(h.dtype)
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            scale, shift = th.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = h + emb_out
+            h = self.out_layers(h)
+        return self.skip_connection(x) + h
     
 # use qna attention block
 class AttentionBlock(nn.Module):
@@ -80,20 +218,17 @@ class AttentionBlock(nn.Module):
             use_new_attention_order=False,
             use_qna=True,
             kernel_size=3,
+            padding=1,
+            padding_mode='zeros',
             device=torch.device("cuda")
             ):
         super().__init__()
         self.channels = channels
         self.use_qna = use_qna
         self.num_heads = num_heads
-        self.norm = nn.InstanceNorm1d(channels, affine=True)
-        self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(channels, channels * 2)),
-            ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(channels * 2, channels)),
-            ("dropout", nn.Dropout(p=0.1))
-        ])).to(device)
-        self.norm_2 = nn.InstanceNorm1d(channels, affine=True)
+        self.norm = normalization(channels)
+
+        # self.norm_2 = normalization(channels)
         # TODO not use qna
         if use_qna:
             self.attention = FusedQnA1d(
@@ -106,16 +241,16 @@ class AttentionBlock(nn.Module):
                 padding=(kernel_size - 1) // 2,
             )
     
-    def forward(self, q, x, scale=1):
+    def forward(self, x):
         b, c, *spatial = x.shape
         x = x.reshape(b, c, -1)
-        q = q.reshape(b, c, -1)
+        # q = q.reshape(b, c, -1)
         h = self.norm(x).reshape(b, c, 1, -1)
-        h = self.attention(h, input_q=q)
+        h = self.attention(h)
         h = h.reshape(b, c, -1)
         # print(f"h============{h.shape}")
-        h = self.mlp(self.norm_2(h).permute(0, 2, 1)).permute(0, 2, 1)
-        return (x + scale * h).reshape(b, c, *spatial)
+        # h = self.mlp(self.norm_2(h).permute(0, 2, 1)).permute(0, 2, 1)
+        return  (x + h).reshape(b, c, *spatial)
     
 
     
@@ -124,12 +259,27 @@ class Transformer(nn.Module):
         super().__init__()
         self.width = width
         self.layers = layers
-        # self.resblocks = [ResidualCrossAttentionBlock(width, heads, device) for _ in range(layers)]
-        self.resblocks = nn.ModuleList([AttentionBlock(width, num_heads=heads, device=device) for _ in range(layers)])
+        self.inputblocks = nn.ModuleList([ResBlock(
+                            width,
+                            width,
+                            dropout=0.1,
+                            out_channels=width,
+                        ) for _ in range(layers // 2)])
+        self.qnablocks = nn.ModuleList([AttentionBlock(width, num_heads=heads, device=device) for _ in range(layers)])
+        self.outputblocks = nn.ModuleList([ResBlock(
+                            width,
+                            width,
+                            dropout=0.1,
+                            out_channels=width,
+                        ) for _ in range(layers // 2)])
 
     def forward(self, q: torch.Tensor, x: torch.Tensor, scale=1):
-        for resblock in self.resblocks:
-            x = resblock(q, x, scale) 
+        for resblock in self.inputblocks:
+            x = resblock(x, q)
+        for qnablock in self.qnablocks:
+            x = qnablock(x) 
+        for resblock in self.outputblocks:
+            x = resblock(x, q)
         return x
     
     
@@ -182,17 +332,10 @@ class MogoAdapter(nn.Module):
         nn.init.normal_(self.positional_embedding, std=0.01)
         
         nn.init.normal_(self.cond_emb.weight, std=(2 * self.mogo_dim) ** -0.5)
-        # nn.init.normal_(self.input_emb.weight, std=(2 * self.mogo_dim) ** -0.5)
+        nn.init.normal_(self.input_emb.weight, std=(2 * self.mogo_dim) ** -0.5)
         nn.init.normal_(self.head.weight, std=(2 * self.mogo_dim) ** -0.5)
         
-        proj_std = (self.width ** -0.5) * ((2 * self.layers) ** -0.5)
-        attn_std = self.width ** -0.5
-        fc_std = (2 * self.width) ** -0.5
-        for block in self.transformer.resblocks:
-                # nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-                # nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-                nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-                nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
                 
     def parameters(self):
         return [p for name, p in self.named_parameters() if not name.startswith('mogo.')]
@@ -230,20 +373,37 @@ class MogoAdapter(nn.Module):
         
         generated = torch.empty(batch_size, 0, self.mogo_q_layers, dtype=torch.long).to(self.device)
         for k in range(seq_len):
-            out, all_attends_out = transformotion(prompt_texts, generated, m_lens, labels=labels[:, k:k+1], mems=None, is_generating=True, has_adapter=True)
-            all_attends_out = all_attends_out.permute(0, 1, 3, 2)
-            res_features, res_all_out = self.forward(all_attends_out, refer_motion_clip_features, scale=scale)
-            logits = res_all_out.permute(0, 1, 3, 2)
-            probs = F.softmax(logits[:,-1,:, :], dim=-1)  # (b, seqlen, ntoken)
+            logits, all_attends_out = transformotion(prompt_texts, generated, m_lens, labels=labels[:, k:k+1], mems=None, is_generating=True, has_adapter=True)
+            logits = logits.permute(0, 1, 3, 2)
+            
+            probs = F.softmax(logits[:,-1,:, :], dim=-1)
             dist = Categorical(probs)
             pred_ids = dist.sample()
             pred_ids = pred_ids.unsqueeze(1)
             res_seq_ids.append(pred_ids)
             generated = torch.cat(res_seq_ids, dim=1)
+            
+            
+            # all_attends_out = all_attends_out.permute(0, 1, 3, 2)
+            # res_features, res_all_out = self.forward(all_attends_out, refer_motion_clip_features, scale=scale)
+            # logits = res_all_out.permute(0, 1, 3, 2)
+            # probs = F.softmax(logits[:,-1,:, :], dim=-1)  # (b, seqlen, ntoken)
+            # dist = Categorical(probs)
+            # pred_ids = dist.sample()
+            # pred_ids = pred_ids.unsqueeze(1)
+            # res_seq_ids.append(pred_ids)
+            # generated = torch.cat(res_seq_ids, dim=1)
         motion_ids = torch.cat(res_seq_ids, dim=1).to(self.device)
-        print(f"motion motion_ids ========================+> {motion_ids}\n labels====> {labels}")
+        # print(f"motion motion_ids ========================+> {motion_ids}\n labels====> {labels}")
+        input_motion_logits = transformotion.tok_emb(motion_ids)
+        res_features, res_all_out = self.forward(input_motion_logits, refer_motion_clip_features, scale=scale)
+        out = res_all_out.permute(0, 1, 3, 2)
+        probs = F.softmax(out, dim=-1)  # (b, seqlen, ntoken)
+        dist = Categorical(probs)
+        pred_ids = dist.sample()
+        print(f"motion motion_ids ========================+> {pred_ids}\n labels====> {labels}")
         # gathered_ids = repeat(motion_ids.unsqueeze(-1), 'b n -> b n d', d=6)
-        pred_motions = vq_model.forward_decoder(motion_ids)
+        pred_motions = vq_model.forward_decoder(pred_ids)
         # print(f"motion pred_motions ========================+> {pred_motions.shape}\n labels========================+> {labels.shape}")
         # self.seqTransDecoderXL.train()
     
